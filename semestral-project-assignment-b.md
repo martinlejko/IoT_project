@@ -113,7 +113,7 @@ They get a simple Table Storage data source and a clean access pattern. They do 
 The algorithm is stateful and needs all batches from one merchant processed **in-order**.
 
 - **Partition key = `merchantId`.** Event Hub keeps all events with the same key on one partition, in order.
-- **Business sequence = `batchSequence`.** The Notifier / Publisher publishes only contiguous ready batches per merchant. If batch 124 is ready before 123, it waits until 123 is ready.
+- **Business sequence = `batchSequence`.** The Notifier / Publisher publishes only contiguous ready batches per merchant. If batch 124 is ready before 123, it waits until 123 is ready. A bounded wait guards against a batch that is never uploaded: if the gap is not filled within a configurable window, the publisher emits a gap marker and releases the later batches so one missing upload cannot stall a merchant forever (see Limits).
 - One partition is read by **one** consumer instance at a time. So one merchant maps to one worker instance. State stays consistent.
 - A dedicated **consumer group** for fraud detection keeps it isolated from other readers.
 
@@ -158,7 +158,7 @@ Constraint: 0.5 s CPU per 1 MiB. A 1 GiB batch = ~512 CPU-seconds (~8.5 min) for
 
 - Parallelism = number of Event Hub partitions. Each partition is processed by one worker.
 - Required worker CPU can be estimated as `100000 / 1800 * averageBatchSizeMiB * 0.5`. For example, 10 MiB average batches during the 30-minute day period need about 278 vCPU to keep up in real time.
-- Partition count is sized up front for the target throughput. We avoid changing partition count dynamically because ordering depends on `merchantId` partitioning.
+- Partition count is sized up front for the target throughput: it must be at least the number of batches that have to run concurrently to keep up. The ~278 vCPU above implies on the order of a few hundred partitions for the 10 MiB-average day period (one batch per partition at a time), so we provision a comparable partition count plus headroom. We avoid changing partition count dynamically because ordering depends on `merchantId` partitioning.
 - Peak load (day, every 30 min) is far higher than night (every 6 h). Premium Functions scale out on partition lag and back down when idle, so we pay for what we use.
 - A single very large merchant is a hot key by design. Its batches cannot be processed in parallel without breaking the algorithm's in-order requirement.
 
@@ -212,10 +212,11 @@ PartitionKey: "merchant"
 RowKey:       <merchantId>
 investigatorId: string
 market:         string
+mappingVersion: long      // monotonic refresh counter, bumped on each successful fetch
 expiresAt:      DateTime
 ```
 
-- A **Mapping Refresher** Function fills the cache (timer + lazy on miss).
+- A **Mapping Refresher** Function fills the cache (timer + lazy on miss). Each successful fetch bumps `mappingVersion`. "A newer mapping is observed" means the freshly fetched `investigatorId` differs from the cached one; the new (higher) `mappingVersion` is then stamped onto reindexed alert rows so reindexing is idempotent and ordered.
 - On expiry we serve stale data and refresh in the background. The mapping changes rarely, so stale-while-revalidate is safe and keeps the app fast even when the 3rd party is down.
 - The 3rd party API has no change feed, so strict real-time reassignment while it is down is impossible. The system is correct for the latest mapping version it has observed and repairs alert indexes after a newer mapping is successfully fetched.
 
@@ -231,7 +232,7 @@ expiresAt:      DateTime
 | `eventhub_consumer_lag` | Async UpDownCounter | Unprocessed events per partition (queued minus processed) | `{event}` |
 | `batch_processing_duration` | Histogram | Wall-clock time to process one batch | `s` |
 
-The counter tracks throughput. The lag gauge warns when the worker falls behind. The histogram shows the processing-time distribution and tail latency.
+The counter tracks throughput. The lag metric (async UpDownCounter) warns when the worker falls behind. The histogram shows the processing-time distribution and tail latency.
 
 ### Trace: `GET /investigators/{id}/alerts`
 
@@ -306,7 +307,8 @@ Telemetry is exported via OpenTelemetry (OTLP `http/protobuf`) to a backend such
 - **Partition count caps parallelism.** One merchant = one partition slot at a time. A few very large merchants can create hot partitions. Mitigation: enough partitions and even key distribution.
 - **Stale mapping.** We trade strict freshness for availability and speed. Acceptable because the mapping changes rarely.
 - **Resolve = delete + insert.** Slightly more work than a property update, but it keeps the "unresolved" query a fast prefix range query.
-- **At-least-once + idempotency**, not exactly-once. Simpler and still 100% correct because writes are idempotent on `batchId`.
+- **At-least-once + idempotency**, not exactly-once. Simpler and still 100% correct because writes are idempotent on `batchId`/`alertId`.
+- **Contiguous ordering vs. a missing upload.** Publishing only contiguous `batchSequence` values means one batch that is never uploaded would block all later batches for that merchant. We bound the wait and emit a gap marker so a single lost upload degrades that merchant's stream rather than stalling it; the gap is reconciled if the batch later arrives.
 
 ---
 

@@ -106,3 +106,22 @@ flowchart LR
 - No live calls to the 3rd party API — always cached.
 
 Every "no" follows the same rule: choose the simpler design that still meets the guarantees.
+
+---
+
+## Anticipated questions (defense prep)
+
+**Q: What if a merchant never uploads batch 123 — does the contiguous-sequence rule stall everything after it?**
+The algorithm needs *in-order*, not *gap-free*. Event Hub already preserves publication order per `merchantId` partition; `batchSequence` only protects against the Notifier publishing out of order when blob-created triggers fire out of order. So the publisher waits for a gap only for a bounded window; past that it emits a gap marker and releases later batches. One lost upload degrades that merchant's stream instead of stalling it forever.
+
+**Q: How do you know a mapping is "newer" when reindexing alerts?**
+`mapping_cache` carries a monotonic `mappingVersion`, bumped on every successful fetch. "Newer" = the freshly fetched `investigatorId` differs from the cached one; the higher version is stamped onto reindexed alert rows, so reindexing is idempotent and never moves an alert backwards.
+
+**Q: How many Event Hub partitions?**
+Sized up front to the required concurrency. The worst-case formula `100000 / 1800 * avgMiB * 0.5` gives ~278 vCPU for 10 MiB day batches; since one partition processes one batch at a time, we provision on the order of a few hundred partitions plus headroom. We don't rescale partitions dynamically because ordering depends on `merchantId` partitioning.
+
+**Q: Why at-least-once and not exactly-once?**
+Exactly-once across queue + state store + alert store + checkpoint needs distributed transactions — slow and complex. Instead: publish alerts durably → persist state → checkpoint. Deterministic `batchId`/`alertId` make every replay idempotent (skip or upsert), so results are still 100% correct. This is D4.
+
+**Q: Why three metric types specifically?**
+The assignment asks for three distinct kinds. We picked Counter (`batches_ingested_total`, throughput), async UpDownCounter (`eventhub_consumer_lag`, can rise and fall, sampled asynchronously), and Histogram (`batch_processing_duration`, distribution + tail). Three genuinely different kinds, each matching what it measures.
