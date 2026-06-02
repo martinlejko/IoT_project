@@ -29,9 +29,11 @@ The design follows three guarantees from the assignment:
 ```mermaid
 flowchart LR
     M[Merchant backend] -->|1. request upload URL| ING[Ingestion API\nFunction HTTP]
-    ING -->|2. SAS URL| M
+    ING -->|2. SAS URL + batchId/sequence| M
     M -->|3. PUT ZIP| BLOB[(Blob Storage\nbatches)]
-    BLOB -->|4. Blob Created event| NOTIFY[Notifier\nFunction Blob trigger]
+    BLOB -->|4. Blob Created event| NOTIFY[Notifier / Publisher\nFunction Blob+Timer]
+    ING -->|allocate expected batch| REG[(Table Storage\nbatch registry)]
+    NOTIFY -->|record ready / outbox| REG[(Table Storage\nbatch registry)]
     NOTIFY -->|5. publish ref\npk = merchantId| EH[[Event Hub\nbatch-refs]]
 
     EH -->|cg: fraud| FD[Fraud Detection\nPython worker]
@@ -49,12 +51,13 @@ flowchart LR
 
 ### Data flow
 
-1. Merchant calls the **Ingestion API** to get a short-lived SAS upload URL.
+1. Merchant calls the **Ingestion API** to get a short-lived SAS upload URL, stable `batchId`, next `batchSequence` for this merchant, and a deterministic blob path. Before returning the SAS URL, the API creates an `allocated` registry row for that expected batch.
 2. Merchant uploads the ZIP directly to **Blob Storage**. Large files (up to 1 GiB) never pass through our compute.
-3. A **Blob trigger** Function publishes a small *reference message* to the **batch-refs Event Hub**. The message holds the blob path and `merchantId`, not the data itself.
-4. The **Fraud Detection** worker consumes references, downloads the batch from Blob, runs the algorithm, and emits alerts to the **alerts Event Hub**.
-5. The **Alert Writer** Function stores alerts in **Table Storage**.
-6. The **Fraud Ops App** reads alerts and lets investigators resolve them.
+3. A **Blob Created event** triggers the Notifier. The Notifier verifies the expected blob path/metadata, records the batch as ready, and writes a durable outbox row.
+4. The Notifier publishes a small *reference message* to the **batch-refs Event Hub**. The message holds the blob path, `merchantId`, `batchId`, and `batchSequence`, not the data itself. A timer retry scans `allocated` registry rows, checks whether the blob exists, records missed blobs as ready, and republishes ready outbox rows after transient Blob trigger or Event Hub failures.
+5. The **Fraud Detection** worker consumes references, downloads the batch from Blob, runs the algorithm, and emits alerts to the **alerts Event Hub**.
+6. The **Alert Writer** Function stores alerts in **Table Storage**.
+7. The **Fraud Ops App** reads alerts and lets investigators resolve them.
 
 ### Why upload to Blob directly, not through the API
 
@@ -68,8 +71,8 @@ Event Hub messages are capped at ~1 MB. Batches reach 1 GiB. So we never stream 
 
 | Component | Hosting | Trigger | Job |
 |---|---|---|---|
-| Ingestion API | Azure Functions (HTTP) | HTTP | Issue SAS upload URLs |
-| Notifier | Azure Functions (Blob) | Blob Created | Publish batch reference to Event Hub |
+| Ingestion API | Azure Functions (HTTP) | HTTP | Issue SAS upload URLs and stable batch IDs |
+| Notifier / Publisher | Azure Functions (Blob + Timer) | Blob Created + retry timer | Validate uploaded blobs, keep a durable outbox, publish ordered batch references to Event Hub |
 | Alert Writer | Azure Functions (Event Hub) | alerts Event Hub | Persist alerts to Table Storage |
 | Mapping Refresher | Azure Functions (Timer/HTTP) | Timer + on-miss | Cache the 3rd party mapping |
 
@@ -79,7 +82,7 @@ These are short, stateless, I/O-bound jobs. The Consumption plan fits well and s
 
 | Component | Hosting | Trigger | Job |
 |---|---|---|---|
-| Fraud Detection worker | App Service plan (Premium Functions or AKS) | batch-refs Event Hub | Run the stateful algorithm |
+| Fraud Detection worker | Azure Functions Premium | batch-refs Event Hub | Run the stateful algorithm |
 
 See Section 5 for why this one is **not** on the Consumption plan.
 
@@ -91,6 +94,18 @@ See Section 5 for why this one is **not** on the Consumption plan.
 
 They get a simple Table Storage data source and a clean access pattern. They do not touch streaming.
 
+### Custom operations and dependencies
+
+| Operation | Direct dependencies | Transitive dependencies |
+|---|---|---|
+| `POST /batch-uploads` | Blob Storage SAS generation, batch registry table | Merchant authentication |
+| Blob Created notifier / publisher | Blob Storage, batch registry/outbox table, batch-refs Event Hub | Ingestion API batch ID and sequence allocation |
+| Fraud Detection worker | batch-refs Event Hub, batches Blob container, ML state Blob container, alerts Event Hub | Notifier ordering protocol |
+| Alert Writer | alerts Event Hub, alerts Table Storage, mapping cache Table Storage | Mapping Refresher |
+| `GET /investigators/{id}/alerts` | alerts Table Storage | Mapping Refresher and alert reindexing |
+| Resolve alert endpoint | alerts Table Storage | Mapping Refresher |
+| Mapping Refresher | 3rd party REST API, mapping cache Table Storage, market index Table Storage | Alert reindexing |
+
 ---
 
 ## 4. Ordering and the fraud detection worker
@@ -98,6 +113,7 @@ They get a simple Table Storage data source and a clean access pattern. They do 
 The algorithm is stateful and needs all batches from one merchant processed **in-order**.
 
 - **Partition key = `merchantId`.** Event Hub keeps all events with the same key on one partition, in order.
+- **Business sequence = `batchSequence`.** The Notifier / Publisher publishes only contiguous ready batches per merchant. If batch 124 is ready before 123, it waits until 123 is ready. A bounded wait guards against a batch that is never uploaded: if the gap is not filled within a configurable window, the publisher emits a gap marker and releases the later batches so one missing upload cannot stall a merchant forever (see Limits).
 - One partition is read by **one** consumer instance at a time. So one merchant maps to one worker instance. State stays consistent.
 - A dedicated **consumer group** for fraud detection keeps it isolated from other readers.
 
@@ -108,12 +124,21 @@ This is the *Sequential Convoy* pattern from Lesson 3.
 - State is keyed by `merchantId` (one blob per merchant, e.g. `ml-state/{merchantId}.json`).
 - On startup or partition reassignment, the worker loads state from Blob.
 - While the worker owns the partition, it **caches state in memory**. No reload per batch.
-- After processing a batch it persists state, then checkpoints the Event Hub offset. Persist-before-checkpoint keeps the two in sync after a crash.
+- After processing a batch it first publishes all generated alerts durably to the alerts Event Hub, then persists ML state, then checkpoints the batch-refs Event Hub offset. Persist-before-checkpoint keeps the two in sync after a crash, and alert-before-state prevents committed state without durable alert output.
 
 ### Correctness on faults
 
 - Event Hub gives at-least-once delivery. A crash before checkpoint replays the batch.
-- Each batch has a stable `batchId`. State writes record the last applied `batchId`. A replayed batch is detected and skipped. So replays are idempotent and results stay 100% correct.
+- Each batch has a stable `batchId` and `batchSequence`. State records the last committed sequence. A replayed batch is detected and skipped only after its alerts were already published durably.
+- Alert IDs are deterministic, e.g. `hash(merchantId, batchSequence, findingType, findingNaturalKey)`. The Alert Writer upserts deterministic canonical and investigator-index rows, so duplicated alert events do not create duplicate alerts.
+- The Alert Writer checkpoints the alerts Event Hub only after both the canonical row and the investigator index row are written.
+
+| Failure point | Recovery |
+|---|---|
+| Crash before alert publication | No state update and no checkpoint; Event Hub replays the batch. |
+| Crash after alert publication but before state update | Replay republishes the same deterministic alert IDs; Alert Writer deduplicates. |
+| Crash after state update but before checkpoint | Replay sees the committed sequence and checkpoints; alerts are already durable because they were published before state update. |
+| Alert Writer crash after partial writes | alerts Event Hub replays; deterministic row keys fill missing rows without duplicates. |
 
 ---
 
@@ -132,8 +157,10 @@ Constraint: 0.5 s CPU per 1 MiB. A 1 GiB batch = ~512 CPU-seconds (~8.5 min) for
 ### Scaling and parallelism
 
 - Parallelism = number of Event Hub partitions. Each partition is processed by one worker.
-- 100k merchants spread over the partitions. Start with 32 partitions (Standard) and move to a Premium/Dedicated Event Hub if more concurrency is needed.
+- Required worker CPU can be estimated as `100000 / 1800 * averageBatchSizeMiB * 0.5`. For example, 10 MiB average batches during the 30-minute day period need about 278 vCPU to keep up in real time.
+- Partition count is sized up front for the target throughput: it must be at least the number of batches that have to run concurrently to keep up. The ~278 vCPU above implies on the order of a few hundred partitions for the 10 MiB-average day period (one batch per partition at a time), so we provision a comparable partition count plus headroom. We avoid changing partition count dynamically because ordering depends on `merchantId` partitioning.
 - Peak load (day, every 30 min) is far higher than night (every 6 h). Premium Functions scale out on partition lag and back down when idle, so we pay for what we use.
+- A single very large merchant is a hot key by design. Its batches cannot be processed in parallel without breaking the algorithm's in-order requirement.
 
 ---
 
@@ -156,6 +183,7 @@ alertId:       string
 detectedAt:    DateTime
 status:        string  // open | resolved
 details:       string
+mappingVersion: long
 ```
 
 - "Unresolved alerts for an investigator" = range query on `PartitionKey = investigatorId` and `RowKey` prefix `0open`. Efficient point/range access only (Lesson 2).
@@ -163,6 +191,16 @@ details:       string
 - Resolving an alert moves the row from `0open...` to `1done...` (delete + insert). Both rows share the partition, so it is a single-partition transaction.
 
 The Alert Writer resolves `responsibleInvestigatorId` from the mapping cache (below) when writing each alert.
+
+To make reassignment safe, we also keep a canonical copy of each alert keyed by merchant:
+
+```
+Table: alerts_by_merchant
+PartitionKey: <merchantId>
+RowKey:       <alertId>
+```
+
+If the Mapping Refresher later observes that a merchant moved to another investigator, an Alert Reindexer reads open rows from `alerts_by_merchant`, inserts equivalent `0open...` rows under the new investigator, and deletes old open rows under the previous investigator. If no mapping is known yet, the alert is kept canonically and temporarily indexed under `unassigned`; it is moved once the mapping is discovered.
 
 ### Caching the 3rd party mapping
 
@@ -174,11 +212,13 @@ PartitionKey: "merchant"
 RowKey:       <merchantId>
 investigatorId: string
 market:         string
+mappingVersion: long      // monotonic refresh counter, bumped on each successful fetch
 expiresAt:      DateTime
 ```
 
-- A **Mapping Refresher** Function fills the cache (timer + lazy on miss).
+- A **Mapping Refresher** Function fills the cache (timer + lazy on miss). Each successful fetch bumps `mappingVersion`. "A newer mapping is observed" means the freshly fetched `investigatorId` differs from the cached one; the new (higher) `mappingVersion` is then stamped onto reindexed alert rows so reindexing is idempotent and ordered.
 - On expiry we serve stale data and refresh in the background. The mapping changes rarely, so stale-while-revalidate is safe and keeps the app fast even when the 3rd party is down.
+- The 3rd party API has no change feed, so strict real-time reassignment while it is down is impossible. The system is correct for the latest mapping version it has observed and repairs alert indexes after a newer mapping is successfully fetched.
 
 ---
 
@@ -192,7 +232,7 @@ expiresAt:      DateTime
 | `eventhub_consumer_lag` | Async UpDownCounter | Unprocessed events per partition (queued minus processed) | `{event}` |
 | `batch_processing_duration` | Histogram | Wall-clock time to process one batch | `s` |
 
-The counter tracks throughput. The lag gauge warns when the worker falls behind. The histogram shows the processing-time distribution and tail latency.
+The counter tracks throughput. The lag metric (async UpDownCounter) warns when the worker falls behind. The histogram shows the processing-time distribution and tail latency.
 
 ### Trace: `GET /investigators/{id}/alerts`
 
@@ -267,7 +307,8 @@ Telemetry is exported via OpenTelemetry (OTLP `http/protobuf`) to a backend such
 - **Partition count caps parallelism.** One merchant = one partition slot at a time. A few very large merchants can create hot partitions. Mitigation: enough partitions and even key distribution.
 - **Stale mapping.** We trade strict freshness for availability and speed. Acceptable because the mapping changes rarely.
 - **Resolve = delete + insert.** Slightly more work than a property update, but it keeps the "unresolved" query a fast prefix range query.
-- **At-least-once + idempotency**, not exactly-once. Simpler and still 100% correct because writes are idempotent on `batchId`.
+- **At-least-once + idempotency**, not exactly-once. Simpler and still 100% correct because writes are idempotent on `batchId`/`alertId`.
+- **Contiguous ordering vs. a missing upload.** Publishing only contiguous `batchSequence` values means one batch that is never uploaded would block all later batches for that merchant. We bound the wait and emit a gap marker so a single lost upload degrades that merchant's stream rather than stalling it; the gap is reconciled if the batch later arrives.
 
 ---
 
@@ -298,6 +339,8 @@ RowKey:       <merchantId>
 
 "All merchants in a market" = one partition range query. The Fraud Ops App reads it directly. No inefficient fan-out against the slow 3rd party API.
 
+The index contains merchants known from ingestion and merchants discovered through investigator mapping refreshes. The 3rd party API has no "list all merchants" endpoint, so a completely inactive merchant that never appears in either source cannot be discovered proactively.
+
 ---
 
 ## Sources
@@ -308,5 +351,3 @@ RowKey:       <merchantId>
 - [Blob Storage lifecycle management overview](https://learn.microsoft.com/en-us/azure/storage/blobs/lifecycle-management-overview)
 - [Blob access tiers (hot / cool / cold / archive)](https://learn.microsoft.com/en-us/azure/storage/blobs/access-tiers-overview)
 - [Sequential Convoy pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/sequential-convoy)
-</content>
-</invoke>

@@ -18,7 +18,7 @@ flowchart TD
     E --> F{Batch fits in\n10 min limit?}
     F -->|No: 1 GiB = ~8.5 min CPU| G[Functions Premium\nno timeout]
     G --> H{Need exactly-once?}
-    H -->|Too complex| I[At-least-once\n+ idempotent on batchId]
+    H -->|Too complex| I[At-least-once\n+ idempotent batchId/alertId]
 ```
 
 ---
@@ -27,17 +27,19 @@ flowchart TD
 
 ### D1 — Upload batches to Blob, queue only a reference
 
-**Why:** Event Hub messages cap at ~1 MB. Batches reach 1 GiB. Pushing the payload through the queue is impossible. So the merchant writes the file straight to Blob with a short-lived SAS URL. We queue a tiny `{blobPath, merchantId, batchId}` message.
+**Why:** Event Hub messages cap at ~1 MB. Batches reach 1 GiB. Pushing the payload through the queue is impossible. So the merchant writes the file straight to Blob with a short-lived SAS URL. We queue a tiny `{blobPath, merchantId, batchId, batchSequence}` message.
 
 **Trade-off:** one extra step (request a SAS URL) for the merchant. Worth it — large files never touch our compute, so cost and latency stay low.
 
 **Rejected:** sending the ZIP in an HTTP request body. Big bodies, slow, expensive, and fragile on retries.
 
+**Correctness detail:** the Ingestion API creates an `allocated` registry row when it issues the SAS URL. The Blob trigger normally marks the row ready and stores a durable outbox row. If the Blob trigger or Event Hub publish fails, a timer retry scans allocated registry rows, checks whether the blob exists, and republishes the reference.
+
 ---
 
 ### D2 — Event Hub, partitioned by `merchantId`
 
-**Why:** The algorithm is stateful and needs in-order processing per merchant. Event Hub keeps same-key events on one partition, in order, read by one consumer at a time. So one merchant always maps to one worker. This is the **Sequential Convoy** pattern (Lesson 3).
+**Why:** The algorithm is stateful and needs in-order processing per merchant. The Ingestion API assigns a monotonic `batchSequence`, and the Notifier / Publisher publishes only contiguous ready batches. Event Hub then keeps same-key events on one partition, in order, read by one consumer at a time. So one merchant always maps to one worker. This is the **Sequential Convoy** pattern (Lesson 3).
 
 **Why not Service Bus:** Service Bus is a traditional broker, great for routing and per-message TTL. But we want a high-throughput, replayable, partitioned log. Event Hub fits streaming better and supports replay for fault recovery.
 
@@ -61,7 +63,7 @@ flowchart LR
 
 ### D4 — At-least-once + idempotency, not exactly-once
 
-**Why:** Exactly-once across a queue, state store, and checkpoint is hard and slow. Instead the worker persists state, then checkpoints. A crash replays the last batch. Each batch has a stable `batchId`, and state records the last applied one. A replay is detected and skipped.
+**Why:** Exactly-once across a queue, state store, alert store, and checkpoint is hard and slow. Instead the worker publishes alerts durably, then persists state, then checkpoints. A crash replays the last batch. Each batch has a stable `batchId`, state records the last committed sequence, and alerts have deterministic `alertId`s. A replay is detected and skipped or upserted idempotently.
 
 **Result:** results are still 100% correct, with far less complexity. This satisfies the correctness guarantee without distributed transactions.
 
@@ -79,7 +81,7 @@ flowchart LR
 
 **Why:** The mapping API is slow and unreliable. We never call it on the request path. A refresher Function fills a Table cache. On expiry we serve stale data and refresh in the background.
 
-**Why this is safe:** the merchant→investigator mapping changes rarely. Stale-while-revalidate keeps the app fast and available even when the 3rd party is down.
+**Why this is safe:** the merchant→investigator mapping changes rarely. Stale-while-revalidate keeps the app fast and available even when the 3rd party is down. When a newer mapping is observed, open alert index rows are reindexed to the new investigator.
 
 ---
 
@@ -87,8 +89,8 @@ flowchart LR
 
 | Requirement | What delivers it |
 |---|---|
-| 100% correct under faults | At-least-once + idempotent `batchId` (D4) |
-| In-order per merchant | Event Hub partition key (D2) |
+| 100% correct under faults | At-least-once + deterministic `batchId`/`alertId` and commit ordering (D4) |
+| In-order per merchant | `batchSequence` + Event Hub partition key (D2) |
 | Cost efficient | Serverless Functions, SAS direct-to-Blob, Archive tier |
 | Scalable under variable load | Partition-driven scale-out, Premium auto-scale (D3) |
 | Fast investigator queries | Investigator-keyed table (D5) |
@@ -104,4 +106,22 @@ flowchart LR
 - No live calls to the 3rd party API — always cached.
 
 Every "no" follows the same rule: choose the simpler design that still meets the guarantees.
-</content>
+
+---
+
+## Anticipated questions (defense prep)
+
+**Q: What if a merchant never uploads batch 123 — does the contiguous-sequence rule stall everything after it?**
+The algorithm needs *in-order*, not *gap-free*. Event Hub already preserves publication order per `merchantId` partition; `batchSequence` only protects against the Notifier publishing out of order when blob-created triggers fire out of order. So the publisher waits for a gap only for a bounded window; past that it emits a gap marker and releases later batches. One lost upload degrades that merchant's stream instead of stalling it forever.
+
+**Q: How do you know a mapping is "newer" when reindexing alerts?**
+`mapping_cache` carries a monotonic `mappingVersion`, bumped on every successful fetch. "Newer" = the freshly fetched `investigatorId` differs from the cached one; the higher version is stamped onto reindexed alert rows, so reindexing is idempotent and never moves an alert backwards.
+
+**Q: How many Event Hub partitions?**
+Sized up front to the required concurrency. The worst-case formula `100000 / 1800 * avgMiB * 0.5` gives ~278 vCPU for 10 MiB day batches; since one partition processes one batch at a time, we provision on the order of a few hundred partitions plus headroom. We don't rescale partitions dynamically because ordering depends on `merchantId` partitioning.
+
+**Q: Why at-least-once and not exactly-once?**
+Exactly-once across queue + state store + alert store + checkpoint needs distributed transactions — slow and complex. Instead: publish alerts durably → persist state → checkpoint. Deterministic `batchId`/`alertId` make every replay idempotent (skip or upsert), so results are still 100% correct. This is D4.
+
+**Q: Why three metric types specifically?**
+The assignment asks for three distinct kinds. We picked Counter (`batches_ingested_total`, throughput), async UpDownCounter (`eventhub_consumer_lag`, can rise and fall, sampled asynchronously), and Histogram (`batch_processing_duration`, distribution + tail). Three genuinely different kinds, each matching what it measures.
