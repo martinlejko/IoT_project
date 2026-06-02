@@ -4,7 +4,7 @@
 **Course:** NSWI152 — Cloud Application Development
 **Cloud:** Microsoft Azure (primary region: West Europe)
 
-This is a solution architecture. No implementation is required. We only use services covered in the course: Azure Functions (HTTP and Event Hub triggers), Blob Storage, Table Storage, Event Hubs, Service Bus, App Service, and OpenTelemetry.
+This is a solution architecture. No implementation is required. We only rely on services covered in the course: Azure Functions (HTTP, Blob, Timer, and Event Hub triggers), Blob Storage, Table Storage, Event Hubs, App Service, and OpenTelemetry.
 
 ---
 
@@ -42,10 +42,14 @@ flowchart LR
 
     EHA -->|cg: writer| AW[Alert Writer\nFunction EH trigger]
     AW -->|write| ALERTS[(Table Storage\nalerts)]
+    AW -->|canonical copy| ABM[(Table Storage\nalerts_by_merchant)]
 
     APP[Fraud Ops App\nApp Service] -->|read/resolve| ALERTS
     APP -->|merchant↔investigator| CACHE[(Table Storage\nmapping cache)]
     REFRESH[Mapping Refresher\nFunction] --> CACHE
+    REFRESH --> REINDEX[Alert Reindexer\nFunction]
+    REINDEX --> ALERTS
+    REINDEX --> ABM
     REFRESH -.->|on miss / TTL| THIRD[3rd party REST API]
 ```
 
@@ -63,6 +67,24 @@ flowchart LR
 
 Event Hub messages are capped at ~1 MB. Batches reach 1 GiB. So we never stream the payload through a queue. We stream only a tiny reference. The merchant writes the big file straight to Blob via SAS. This keeps compute cheap and avoids large request bodies.
 
+### Batch registry / outbox schema
+
+The registry and outbox share one Table Storage table partitioned by merchant, so sequence checks are efficient range queries:
+
+```
+Table: batch_registry
+PartitionKey: <merchantId>
+RowKey:       <batchSequencePadded>
+
+batchId:         string
+blobPath:        string
+status:          string  // allocated | ready | published | gap
+uploadExpiresAt: DateTime
+publishedAt:     DateTime?
+```
+
+The Ingestion API creates an `allocated` row with a unique `batchSequence`, using a conditional update on a per-merchant counter row in the same partition to avoid races between concurrent upload requests. The Notifier updates the same row to `ready` after the blob exists. The Publisher scans the merchant partition from the last published sequence, publishes only contiguous `ready` rows, and marks them `published`. Conditional updates make duplicate Blob events and timer retries idempotent.
+
 ---
 
 ## 3. Components and ownership
@@ -75,6 +97,7 @@ Event Hub messages are capped at ~1 MB. Batches reach 1 GiB. So we never stream 
 | Notifier / Publisher | Azure Functions (Blob + Timer) | Blob Created + retry timer | Validate uploaded blobs, keep a durable outbox, publish ordered batch references to Event Hub |
 | Alert Writer | Azure Functions (Event Hub) | alerts Event Hub | Persist alerts to Table Storage |
 | Mapping Refresher | Azure Functions (Timer/HTTP) | Timer + on-miss | Cache the 3rd party mapping |
+| Alert Reindexer | Azure Functions (Timer) | Table-backed mapping-change work item + retry timer | Move open alert index rows when merchant ownership changes |
 
 These are short, stateless, I/O-bound jobs. The Consumption plan fits well and scales to zero.
 
@@ -101,10 +124,11 @@ They get a simple Table Storage data source and a clean access pattern. They do 
 | `POST /batch-uploads` | Blob Storage SAS generation, batch registry table | Merchant authentication |
 | Blob Created notifier / publisher | Blob Storage, batch registry/outbox table, batch-refs Event Hub | Ingestion API batch ID and sequence allocation |
 | Fraud Detection worker | batch-refs Event Hub, batches Blob container, ML state Blob container, alerts Event Hub | Notifier ordering protocol |
-| Alert Writer | alerts Event Hub, alerts Table Storage, mapping cache Table Storage | Mapping Refresher |
+| Alert Writer | alerts Event Hub, alerts Table Storage, alerts_by_merchant Table Storage, mapping cache Table Storage | Mapping Refresher |
 | `GET /investigators/{id}/alerts` | alerts Table Storage | Mapping Refresher and alert reindexing |
 | Resolve alert endpoint | alerts Table Storage | Mapping Refresher |
-| Mapping Refresher | 3rd party REST API, mapping cache Table Storage, market index Table Storage | Alert reindexing |
+| Mapping Refresher | 3rd party REST API, mapping cache Table Storage, market index Table Storage | Alert Reindexer |
+| Alert Reindexer | mapping cache Table Storage, alerts Table Storage, alerts_by_merchant Table Storage | Mapping Refresher |
 
 ---
 
@@ -113,7 +137,7 @@ They get a simple Table Storage data source and a clean access pattern. They do 
 The algorithm is stateful and needs all batches from one merchant processed **in-order**.
 
 - **Partition key = `merchantId`.** Event Hub keeps all events with the same key on one partition, in order.
-- **Business sequence = `batchSequence`.** The Notifier / Publisher publishes only contiguous ready batches per merchant. If batch 124 is ready before 123, it waits until 123 is ready. A bounded wait guards against a batch that is never uploaded: if the gap is not filled within a configurable window, the publisher emits a gap marker and releases the later batches so one missing upload cannot stall a merchant forever (see Limits).
+- **Business sequence = `batchSequence`.** The Notifier / Publisher publishes only contiguous ready batches per merchant. If batch 124 is ready before 123, it waits until 123 is ready. A bounded wait guards against an upload that was allocated but never delivered: after the SAS upload URL has expired, a grace period has passed, and Blob Storage still confirms the expected blob is absent, the publisher emits a gap marker and releases the later batches so one missing upload cannot stall a merchant forever (see Limits).
 - One partition is read by **one** consumer instance at a time. So one merchant maps to one worker instance. State stays consistent.
 - A dedicated **consumer group** for fraud detection keeps it isolated from other readers.
 
@@ -156,9 +180,10 @@ Constraint: 0.5 s CPU per 1 MiB. A 1 GiB batch = ~512 CPU-seconds (~8.5 min) for
 
 ### Scaling and parallelism
 
-- Parallelism = number of Event Hub partitions. Each partition is processed by one worker.
+- Parallelism = number of Event Hub partitions. Each partition is processed by one worker at a time.
 - Required worker CPU can be estimated as `100000 / 1800 * averageBatchSizeMiB * 0.5`. For example, 10 MiB average batches during the 30-minute day period need about 278 vCPU to keep up in real time.
 - Partition count is sized up front for the target throughput: it must be at least the number of batches that have to run concurrently to keep up. The ~278 vCPU above implies on the order of a few hundred partitions for the 10 MiB-average day period (one batch per partition at a time), so we provision a comparable partition count plus headroom. We avoid changing partition count dynamically because ordering depends on `merchantId` partitioning.
+- For normal load we use a single Event Hub with enough partitions. If capacity planning requires hundreds of concurrent partitions, we keep the same logical design but use Event Hubs Dedicated for `batch-refs`, or split merchants by stable market/hash bucket across several identically configured Event Hubs. This is a capacity choice, not a change in the ordering protocol: inside each hub the partition key is still `merchantId`.
 - Peak load (day, every 30 min) is far higher than night (every 6 h). Premium Functions scale out on partition lag and back down when idle, so we pay for what we use.
 - A single very large merchant is a hot key by design. Its batches cannot be processed in parallel without breaking the algorithm's in-order requirement.
 
@@ -200,7 +225,7 @@ PartitionKey: <merchantId>
 RowKey:       <alertId>
 ```
 
-If the Mapping Refresher later observes that a merchant moved to another investigator, an Alert Reindexer reads open rows from `alerts_by_merchant`, inserts equivalent `0open...` rows under the new investigator, and deletes old open rows under the previous investigator. If no mapping is known yet, the alert is kept canonically and temporarily indexed under `unassigned`; it is moved once the mapping is discovered.
+If the Mapping Refresher later observes that a merchant moved to another investigator, an Alert Reindexer reads open rows from `alerts_by_merchant`, inserts equivalent `0open...` rows under the new investigator, and deletes old open rows under the previous investigator. It processes bounded pages of rows per timer invocation, so it stays a short Function job and resumes safely after failures. If no mapping is known yet, the alert is kept canonically and temporarily indexed under `unassigned`; it is moved once the mapping is discovered.
 
 ### Caching the 3rd party mapping
 
@@ -308,15 +333,15 @@ Telemetry is exported via OpenTelemetry (OTLP `http/protobuf`) to a backend such
 - **Stale mapping.** We trade strict freshness for availability and speed. Acceptable because the mapping changes rarely.
 - **Resolve = delete + insert.** Slightly more work than a property update, but it keeps the "unresolved" query a fast prefix range query.
 - **At-least-once + idempotency**, not exactly-once. Simpler and still 100% correct because writes are idempotent on `batchId`/`alertId`.
-- **Contiguous ordering vs. a missing upload.** Publishing only contiguous `batchSequence` values means one batch that is never uploaded would block all later batches for that merchant. We bound the wait and emit a gap marker so a single lost upload degrades that merchant's stream rather than stalling it; the gap is reconciled if the batch later arrives.
+- **Contiguous ordering vs. a missing upload.** Publishing only contiguous `batchSequence` values means one allocated upload that is never delivered would block all later batches for that merchant. We bound the wait by the SAS expiry plus a grace period and emit a gap marker only after the expected blob is confirmed absent. A late upload after expiry is rejected or quarantined and must be resent as a new batch, preserving in-order processing for all batches actually accepted by the cloud.
 
 ---
 
 ## Bonus 1 — Six regions worldwide
 
 - Deploy the **ingest → store → detect → alert** pipeline independently in each region (Blob, Event Hub, Functions per region). Data is processed where it lands. This keeps latency low and respects data residency.
-- The Fraud Ops App stays global. Use **GZRS / RA-GRS** Table Storage, or one alerts store per region with the app querying the investigator's home region.
-- Route merchants to their nearest region by market. Ordering per merchant still holds, because a merchant always lands in one region.
+- The Fraud Ops App is deployed globally on App Service behind a global router. It reads regional alert stores according to the investigator's region/market assignments. Use **GZRS / RA-GRS** for disaster recovery, but keep active writes regional so cross-region replication lag does not affect correctness.
+- Route each merchant to one stable home region by market or merchant configuration. Ordering per merchant still holds, because all batches from that merchant enter the same regional Event Hub.
 
 ## Bonus 2 — Storage cost optimization
 
@@ -346,6 +371,7 @@ The index contains merchants known from ingestion and merchants discovered throu
 ## Sources
 
 - [Azure Event Hubs — features and terminology](https://learn.microsoft.com/en-us/azure/event-hubs/event-hubs-features)
+- [Azure Event Hubs — compare tiers and quotas](https://learn.microsoft.com/en-us/azure/event-hubs/compare-tiers)
 - [Azure Well-Architected — Event Hubs](https://learn.microsoft.com/en-us/azure/well-architected/service-guides/azure-event-hubs)
 - [Event Hubs with Azure Functions — performance and scale](https://learn.microsoft.com/en-us/azure/architecture/serverless/event-hubs-functions/performance-scale)
 - [Blob Storage lifecycle management overview](https://learn.microsoft.com/en-us/azure/storage/blobs/lifecycle-management-overview)
